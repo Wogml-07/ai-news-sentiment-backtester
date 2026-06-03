@@ -1,3 +1,14 @@
+
+## 1번째 셀
+# 스트림릿, 크롤링 라이브러리 설치
+!pip install streamlit requests beautifulsoup4 -q
+
+# 웹 화면을 외부 인터넷 링크로 열어줄 프로그램 설치
+!npm install -g localtunnel -q
+##--------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+## 2번쨰 셀
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -64,3 +75,37 @@ if st.button("뉴스 수집 및 분석 시작", type="primary"):
         st.info(f"🤖 **팀원 2(AI)에게 전달할 데이터 바구니:** {raw_titles}")
     else:
         st.error("뉴스를 가져오지 못했습니다. 종목명을 다시 확인해주세요.")
+
+##------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+##3번째 셀
+
+!pip install pyngrok streamlit beautifulsoup4
+# 3번 셀 코드를 이렇게 수정하세요!
+import os
+import subprocess
+import time
+from pyngrok import ngrok
+
+# 🚨 [필수] 여기에 아까 복사한 나만의 ngrok 토큰을 따옴표 안에 붙여넣으세요!
+ngrok.set_auth_token("여기에_각자의_ngrok_토큰을_입력하세요")
+
+# 1. 스트림릿 서버 백그라운드 구동 (8501번 포트)
+print("⚡ 스트림릿 서버를 가동합니다...")
+subprocess.Popen(["streamlit", "run", "app.py", "--server.port", "8501"])
+time.sleep(3)
+
+# 기존에 켜져있던 에러 난 연결 초기화
+ngrok.kill()
+
+# 8501 포트를 외부 인터넷 주소로 즉시 연결
+try:
+    public_url = ngrok.connect(8501)
+    print("--------------------------------------------------\n")
+    print(f"🔗 아래 주소를 클릭해서 접속하세요:\n{public_url.public_url}")
+    print("--------------------------------------------------\n")
+except Exception as e:
+    print(f"⚠️ 에러 발생: {e}")
