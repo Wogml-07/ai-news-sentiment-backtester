@@ -1,223 +1,361 @@
+import os
+import subprocess
+import time
+
+# -------------------- 네 정보 (네이버 API / ngrok 토큰) --------------------
+# 네이버 개발자센터에서 발급받은 Client ID / Secret
+NAVER_CLIENT_ID = "~"
+NAVER_CLIENT_SECRET = "~"
+# ngrok 대시보드에서 발급받은 Your Authtoken
+NGROK_AUTH_TOKEN = "~"
+# ------------------------------------------------------------------------
+
+# 코랩 환경에 필요한 라이브러리 설치
+os.system("pip install streamlit requests beautifulsoup4 pyngrok pandas -q")
+
+from pyngrok import ngrok
+
+# 아래는 Streamlit 앱 코드(app.py)를 하나의 문자열로 만든 다음
+# 파일로 저장하는 방식이다.
+app_py_text = """
+import streamlit as st
 import requests
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import json
+from datetime import datetime
+import math
+import re
+import random
 
-# ========== 네이버 뉴스 API 크롤링 ==========
-def crawl_naver_news_api(search_keyword, client_id, client_secret):
+# ==========================
+# 1. 네이버 뉴스 API 설정
+# ==========================
+NAVER_CLIENT_ID = "{NAVER_CLIENT_ID}"
+NAVER_CLIENT_SECRET = "{NAVER_CLIENT_SECRET}"
+
+def crawl_naver_news(search_keyword):
+    \"\"\"네이버 뉴스 검색 Open API를 사용해
+    특정 키워드(search_keyword) 관련 최신 뉴스 15개를 가져오는 함수\"\"\"
     url = "https://openapi.naver.com/v1/search/news.json"
-
-    headers = {
-        "X-Naver-Client-Id": 'D4XLqgn7NBXGWwY0bVCD',
-        "X-Naver-Client-Secret": '1hboir3qG_'
-    }
-
     params = {
-        "query": search_keyword,
-        "display": 10,
-        "sort": "date"
+        "query": search_keyword,  # 검색어
+        "display": 15,           # 가져올 뉴스 개수
+        "sort": "date"           # 최신순 정렬
     }
-
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+    }
     try:
-        print(f"🔍 네이버 API로 '{search_keyword}' 뉴스 검색 중...")
-        response = requests.get(url, headers=headers, params=params)
-        response.raise_for_status()
+        resp = requests.get(url, headers=headers, params=params, timeout=5)
+        resp.raise_for_status()          # HTTP 에러 발생 시 예외
+        data = resp.json()
+        return data.get("items", [])     # 뉴스 item 리스트 반환
+    except Exception as e:
+        print("API 에러:", e)
+        return []
 
-        data = response.json()
-        items = data.get('items', [])
+def parse_pubdate_to_datetime(pubdate_str):
+    \"\"\"네이버 뉴스에서 주는 pubDate 문자열을
+    Python datetime 객체로 변환하는 함수\"\"\"
+    try:
+        # 예: 'Mon, 03 Jun 2026 19:42:00 +0900'
+        return datetime.strptime(pubdate_str, "%a, %d %b %Y %H:%M:%S %z")
+    except Exception:
+        return None
 
-        if not items:
-            print("⚠️ 검색 결과가 없습니다.")
-            return []
+def calc_time_weight(pub_dt, now_dt):
+    \"\"\"발행 시간(pub_dt)이 현재(now_dt)와 얼마나 떨어져 있는지에 따라
+    시간 가중치를 계산하는 함수.
 
-        news_list = []
-        for idx, item in enumerate(items):
-            title = item['title'].replace('<b>', '').replace('</b>', '').replace('&quot;', '"')
-            link = item['link']
-            pub_date_str = item['pubDate']
+    - pub_dt가 None이면 0.150으로 고정 (정보 없음 → 가치 낮게)
+    - 0시간 차이: 가중치 1.0
+    - 24시간 차이: exp(-24/24) ≈ 0.37
+    - 48시간 차이: exp(-48/24) ≈ 0.14
+    - 너무 작아지지 않도록 하한 0.05 설정\"\"\"
+    if pub_dt is None:
+        return 0.150
 
-            try:
-                pub_date = datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z")
-            except:
-                pub_date = datetime.now() - timedelta(hours=idx * 2)
+    # 시간 차이를 '시간' 단위로 계산
+    hours = (now_dt - pub_dt).total_seconds() / 3600.0
+    if hours < 0:
+        hours = 0.0
 
-            news_list.append({
-                "title": title,
-                "link": link,
-                "pub_date": pub_date.strftime("%Y-%m-%d %H:%M:%S")
+    # 지수 감소 함수: 시간이 지날수록 가중치가 지수적으로 줄어듦
+    w_raw = math.exp(-hours / 24.0)
+
+    # 0.05 ~ 1.0 사이로 클리핑
+    w = max(0.050, min(1.000, w_raw))
+    return w
+
+# ======================================================
+# 2. 규칙 기반 감성 "모델" - 무조건 ± 점수만 나오게 설계
+#    (0 = neutral 이 전혀 없음)
+# ======================================================
+
+# 강한 긍정 키워드 (나오면 +5점씩)
+strong_pos = [
+    "급등", "폭등", "대폭 상승", "역대급 실적",
+    "신기록 달성", "어닝 서프라이즈", "사상 최대", "강한 매수세"
+]
+
+# 약한 긍정 키워드 (나오면 +2점씩)
+weak_pos = [
+    "상승", "반등", "강세", "호재", "호실적",
+    "개선", "성장", "확대", "수혜", "양호", "호전"
+]
+
+# 강한 부정 키워드 (나오면 -5점씩)
+strong_neg = [
+    "급락", "폭락", "대폭 하락", "최악의 실적",
+    "사상 최악", "어닝 쇼크", "파산", "상장폐지"
+]
+
+# 약한 부정 키워드 (나오면 -2점씩)
+weak_neg = [
+    "하락", "약세", "악재", "적자", "손실",
+    "부진", "논란", "위기", "경고", "우려",
+    "리스크", "소송", "제재", "부정적"
+]
+
+# 의미를 강화하는 표현들 (현재 방향을 1.5배 증폭)
+amplifiers = ["큰", "크게", "대폭", "강하게", "역대급", "심각한", "심각하게", "매우", "상당한"]
+
+# '+3.5%' 같은 퍼센트 변화를 찾기 위한 정규표현식
+percent_pattern = re.compile(r"([+-]?\\d+(?:\\.\\d+)?)%")
+
+def compute_raw_sentiment_score(text: str) -> float:
+    \"\"\"뉴스 제목+요약 텍스트에서
+    키워드/퍼센트/상승·하락 표현을 이용해 원시 감성 점수(raw)를 계산\"\"\"
+    t = text.lower()
+    raw = 0.0
+
+    # 1) 키워드 기반 점수 부여
+    for w in strong_pos:
+        if w in t:
+            raw += 5.0
+    for w in weak_pos:
+        if w in t:
+            raw += 2.0
+
+    for w in strong_neg:
+        if w in t:
+            raw -= 5.0
+    for w in weak_neg:
+        if w in t:
+            raw -= 2.0
+
+    # 2) 퍼센트 변동 (+3%, -5% 등)을 점수에 반영
+    for match in percent_pattern.findall(t):
+        try:
+            val = float(match[0])
+        except:
+            continue
+        if val > 0:
+            # 퍼센트가 클수록 더 큰 긍정 점수 (상한 6점)
+            raw += min(6.0, 0.3 * val)
+        elif val < 0:
+            # 퍼센트가 클수록 더 큰 부정 점수 (상한 -6점)
+            raw -= min(6.0, 0.3 * abs(val))
+
+    # 3) 상승/하락/화살표 패턴
+    if ("↑" in t) or ("상승" in t) or ("급등" in t) or ("강세" in t):
+        raw += 3.0
+    if ("↓" in t) or ("하락" in t) or ("급락" in t) or ("약세" in t):
+        raw -= 3.0
+
+    # 4) 강조어(역대급, 심각한 등)가 있으면 현재 방향을 1.5배 증폭
+    if any(amp in t for amp in amplifiers):
+        if raw > 0:
+            raw *= 1.5
+        elif raw < 0:
+            raw *= 1.5
+
+    return raw
+
+def scale_sentiment_force_nonzero(text: str, raw: float) -> float:
+    \"\"\"원시 점수 raw를 [-1, 1] 범위로 스케일링하되,
+    절대로 0이 나오지 않도록 강제로 ± 값을 만드는 함수\"\"\"
+
+    # 1) raw가 정확히 0이면 → 랜덤 방향으로 최소 강도 부여
+    if raw == 0.0:
+        # 긍정/부정 중 하나를 랜덤 선택
+        direction = random.choice([-1, 1])
+        raw = direction * 3.0  # 최소 강도 3점
+
+    # 2) 너무 큰 값은 [-max_abs, max_abs] 범위로 잘라줌
+    max_abs = 20.0
+    clipped = max(-max_abs, min(max_abs, raw))
+
+    # 3) -1.0 ~ +1.0 범위로 선형 스케일링
+    scaled = clipped / max_abs
+
+    # 4) 스케일링 후 0 근처의 매우 작은 값도 0이 되지 않게 밀어줌
+    #    [0, 0.05) 범위는 0.05로, (-0.05, 0] 범위는 -0.05로 강제
+    if 0.0 <= scaled < 0.05:
+        scaled = 0.05
+    elif -0.05 < scaled < 0.0:
+        scaled = -0.05
+
+    # → 결과적으로 scaled는 절대 0이 될 수 없음
+    return scaled
+
+def sentiment_label_from_score(scaled: float) -> str:
+    \"\"\"스케일링된 점수의 부호에 따라 라벨을 결정
+    - scaled > 0: positive
+    - scaled < 0: negative
+    (0는 절대 나오지 않으므로 neutral 없음)\"\"\"
+    if scaled > 0.0:
+        return "positive"
+    else:
+        return "negative"
+
+def make_investment_decision(total_weighted_score):
+    \"\"\"뉴스 전체의 가중 감성 점수 합(total_weighted_score)에 따라
+    최종 투자 의견(매수/매도/관망)을 결정\"\"\"
+    if total_weighted_score >= 0.3:
+        return "매수", "최근 뉴스 전반이 규칙 기반 감성 분석에서 긍정으로 우세하므로 매수 의견입니다."
+    elif total_weighted_score <= -0.3:
+        return "매도", "최근 뉴스 전반이 규칙 기반 감성 분석에서 부정으로 우세하므로 매도 의견입니다."
+    else:
+        return "관망", "긍정/부정이 큰 차이 없이 섞여 있어 관망 의견입니다."
+
+# ==========================
+# 3. Streamlit 화면 구성
+# ==========================
+
+st.set_page_config(page_title="AI 뉴스 감성분석기 (0 없는 감성 스코어 버전)", layout="wide")
+
+st.title("📈 AI 뉴스 감성 분석 백테스터 (0 없는 감성 스코어)")
+st.caption("네이버 뉴스 → 규칙 기반 감성 점수(-1~1, 0 없음) → 시간 가중치 → 매수/매도/관망")
+
+# 종목명/키워드 입력
+stock_name = st.text_input("분석할 주식 종목명 또는 키워드:", value="삼성전자")
+
+# 버튼 클릭 시 전체 로직 수행
+run_btn = st.button("뉴스 수집 및 감성 분석 시작")
+
+if run_btn:
+    st.write("1️⃣ 뉴스 수집 시작...")
+    items = crawl_naver_news(stock_name)
+    st.write(f"가져온 원시 뉴스 개수: {len(items)}")
+
+    if not items:
+        st.error("뉴스를 가져오지 못했습니다. (items 목록이 비었습니다)")
+    else:
+        st.write("2️⃣ 감성 점수 및 시간 가중치 계산 중...")
+        now_dt = datetime.now().astimezone()
+        records = []
+
+        for i, item in enumerate(items, start=1):
+            # 네이버 뉴스 API 결과에서 제목/요약/링크/발행시각 추출
+            title = item.get("title", "").replace("<b>", "").replace("</b>", "")
+            desc = item.get("description", "").replace("<b>", "").replace("</b>", "")
+            link = item.get("link", "")
+            pub_date = item.get("pubDate", "")
+
+            # 제목 + 요약을 하나의 텍스트로 이어서 감성 분석에 사용
+            text_for_sent = (title + " " + desc).strip()
+            if not text_for_sent:
+                continue
+
+            # ① 규칙 기반으로 원시 점수 계산
+            raw_score = compute_raw_sentiment_score(text_for_sent)
+
+            # ② -1~1 사이로 스케일링(절대 0 안 나오도록 강제)
+            scaled_score = scale_sentiment_force_nonzero(text_for_sent, raw_score)
+
+            # ③ 감성 라벨 결정 (부호 기준)
+            label = sentiment_label_from_score(scaled_score)
+
+            # ④ 발행 시각을 datetime으로 변환 후 시간 가중치 계산
+            pub_dt = parse_pubdate_to_datetime(pub_date)
+            time_weight = calc_time_weight(pub_dt, now_dt)
+
+            # ⑤ 최종 가중 감성 점수 = 감성스코어 × 시간가중치
+            weighted_score = scaled_score * time_weight
+
+            records.append({
+                "제목": title,
+                "요약": desc,
+                "링크": link,
+                "발행시각(raw)": pub_date,
+                "발행시각": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else "",
+                "감성라벨": label,
+                "감성스코어(수치화)": round(scaled_score, 3),  # -1.000 ~ +1.000, 0 없음
+                "시간가중치": round(time_weight, 3),
+                "가중감성점수": round(weighted_score, 3),
             })
 
-            print(f"  [{idx+1}] {title[:60]}...")
+        st.write(f"3️⃣ 감성 분석된 뉴스 개수: {len(records)}")
 
-        print(f"\n✅ 총 {len(news_list)}개의 뉴스 수집 완료!")
-        return news_list
-
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
-            print("❌ API 인증 실패! Client ID와 Secret을 확인하세요.")
-        elif response.status_code == 429:
-            print("⚠️ API 호출 한도 초과. 잠시 후 다시 시도하세요.")
+        if not records:
+            st.error("분석 가능한 뉴스가 없습니다. (records가 비었습니다)")
         else:
-            print(f"❌ API 오류: {e}")
-        return []
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
-        return []
+            # 모든 뉴스의 가중감성점수를 합산
+            df = pd.DataFrame(records)
+            total_weighted_score = float(df["가중감성점수"].sum())
 
-# ========== AI 감성 분석 ==========
-class FinancialSentimentScorer:
-    def __init__(self, model_name="snunlp/KR-FinBERT-SC"):
-        print(f"\n🤖 [AI 모델 로딩] {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.model.eval()
-        print(f"✅ 모델 준비 완료 (디바이스: {self.device})\n")
+            # 최종 투자 의견 결정
+            decision, reason = make_investment_decision(total_weighted_score)
 
-    def compute_sentiment_score(self, text: str) -> dict:
-        if not text or not text.strip():
-            return {"sentiment_score": 0.0, "dominant_label": "중립",
-                    "prob_positive": 0.0, "prob_negative": 0.0, "prob_neutral": 1.0}
+            st.markdown("### 📊 뉴스 감성 분석 테이블")
+            # 표에는 라벨, 감성스코어, 시간가중치만 보여줌
+            st.dataframe(df[["제목", "발행시각", "감성라벨", "감성스코어(수치화)", "시간가중치"]])
 
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True,
-                               max_length=512, padding=True).to(self.device)
+            st.markdown("### 📌 최종 투자 판단")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("가중 합산 감성 점수", f"{total_weighted_score:.3f}")
+            with col_b:
+                st.metric("최종 투자 의견", decision)
 
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            probabilities = F.softmax(outputs.logits, dim=-1).squeeze().cpu().numpy()
+            st.info(reason)
 
-        prob_neg = float(probabilities[0])
-        prob_neu = float(probabilities[1])
-        prob_pos = float(probabilities[2])
+            # 원하면 raw 점수/가중점수까지 보고 디버깅할 수 있도록 expander 제공
+            with st.expander("디버깅용: raw/가중점수 포함 전체 데이터 보기"):
+                st.dataframe(df)
+"""
 
-        sentiment_score = prob_pos - prob_neg
-        labels = ["부정", "중립", "긍정"]
-        final_label = labels[np.argmax(probabilities)]
+# 위 문자열에서 네이버 키를 실제 값으로 치환
+app_py_text = app_py_text.replace("{NAVER_CLIENT_ID}", NAVER_CLIENT_ID)
+app_py_text = app_py_text.replace("{NAVER_CLIENT_SECRET}", NAVER_CLIENT_SECRET)
 
-        return {
-            "sentiment_score": round(sentiment_score, 4),
-            "dominant_label": final_label,
-            "prob_positive": round(prob_pos, 4),
-            "prob_negative": round(prob_neg, 4),
-            "prob_neutral": round(prob_neu, 4)
-        }
+# app.py 파일로 저장
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_py_text)
 
-    def pipeline_scoring(self, df: pd.DataFrame, text_column: str) -> pd.DataFrame:
-        scores, labels, pos_probs, neg_probs, neu_probs = [], [], [], [], []
+print("app.py 생성 완료")
 
-        total = len(df)
-        for idx, row in df.iterrows():
-            res = self.compute_sentiment_score(str(row[text_column]))
-            scores.append(res["sentiment_score"])
-            labels.append(res["dominant_label"])
-            pos_probs.append(res["prob_positive"])
-            neg_probs.append(res["prob_negative"])
-            neu_probs.append(res["prob_neutral"])
+# ==========================
+# 4. ngrok + Streamlit 실행
+# ==========================
 
-            emotion_icon = "😊" if res['dominant_label'] == "긍정" else "😢" if res['dominant_label'] == "부정" else "😐"
-            print(f"  [{idx+1}/{total}] {emotion_icon} {res['dominant_label']} ({res['sentiment_score']:+.3f})")
+from pyngrok import ngrok
 
-        df["sentiment_score"] = scores
-        df["sentiment_label"] = labels
-        df["prob_positive"] = pos_probs
-        df["prob_negative"] = neg_probs
-        df["prob_neutral"] = neu_probs
+print("ngrok 토큰 설정 중...")
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
 
-        return df
+print("Streamlit 서버 가동 중...")
+# 코랩에서 외부 접속 가능하도록 0.0.0.0:8501 에서 스트림릿 실행
+streamlit_proc = subprocess.Popen(
+    ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+# 서버가 뜰 때까지 잠시 대기
+time.sleep(8)
 
-# ========== 가중치 계산 ==========
-def calculate_time_weights(df: pd.DataFrame, half_life_hours=24.0) -> pd.DataFrame:
-    df['pub_date'] = pd.to_datetime(df['pub_date'])
-    df = df.dropna(subset=['pub_date', 'sentiment_score'])
+print("기존 ngrok 세션 종료...")
+ngrok.kill()
 
-    current_time = datetime.now()
-    df['time_difference_hours'] = (current_time - df['pub_date']).dt.total_seconds() / 3600.0
-
-    decay_constant = np.log(2) / half_life_hours
-    df['time_weight'] = np.exp(-decay_constant * df['time_difference_hours'])
-    df['weighted_sentiment_score'] = df['sentiment_score'] * df['time_weight']
-
-    return df
-
-# ========== 투자 판단 ==========
-def generate_trading_signal(df: pd.DataFrame) -> dict:
-    total_score = df['weighted_sentiment_score'].mean()
-    normalized_score = (total_score + 1) * 50
-
-    if normalized_score >= 60:
-        signal, opinion = "BUY 🟢", "매수 추천 (긍정적 감성 우세)"
-    elif normalized_score <= 40:
-        signal, opinion = "SELL 🔴", "매도 추천 (부정적 감성 우세)"
-    else:
-        signal, opinion = "HOLD 🟡", "관망 (중립적 감성)"
-
-    return {
-        "signal": signal,
-        "opinion": opinion,
-        "score": round(normalized_score, 2),
-        "positive_count": len(df[df['sentiment_label'] == '긍정']),
-        "negative_count": len(df[df['sentiment_label'] == '부정']),
-        "neutral_count": len(df[df['sentiment_label'] == '중립']),
-        "total_news": len(df)
-    }
-
-# ========== 메인 실행 ==========
-print("="*70)
-print("📈 AI 뉴스 감성 분석 기반 주식 투자 판단 시스템 (네이버 API 버전)")
-print("="*70)
-
-# 🔑🔑🔑 여기에 발급받은 API 키 입력 🔑🔑🔑
-CLIENT_ID = "여기에_Client_ID_입력"  # ← 따옴표 안에 실제 Client ID 붙여넣기
-CLIENT_SECRET = "여기에_Client_Secret_입력"  # ← 따옴표 안에 실제 Client Secret 붙여넣기
-
-stock_name = "삼성전자"  # 분석할 종목명
-
-print(f"\n[STEP 1] '{stock_name}' 관련 뉴스 수집")
-print("-" * 70)
-news_data = crawl_naver_news_api(stock_name, CLIENT_ID, CLIENT_SECRET)
-
-if not news_data:
-    print("\n❌ 뉴스를 가져오지 못했습니다.")
-    print("💡 확인사항:")
-    print("  1. CLIENT_ID와 CLIENT_SECRET이 올바른지 확인")
-    print("  2. 네이버 개발자 센터에서 '검색' API가 활성화되어 있는지 확인")
-else:
-    df_news = pd.DataFrame(news_data)
-
-    print(f"\n[STEP 2] AI 감성 분석")
-    print("-" * 70)
-    scorer = FinancialSentimentScorer()
-    df_analyzed = scorer.pipeline_scoring(df_news, text_column="title")
-
-    print(f"\n[STEP 3] 시차별 가중치 계산")
-    print("-" * 70)
-    df_weighted = calculate_time_weights(df_analyzed, half_life_hours=24)
-    print("✅ 가중치 계산 완료")
-
-    print(f"\n[STEP 4] 최종 투자 판단")
-    print("-" * 70)
-    result = generate_trading_signal(df_weighted)
-
-    print("\n" + "="*70)
-    print("📊 최종 투자 판단 결과")
-    print("="*70)
-    print(f"🎯 매매 신호: {result['signal']}")
-    print(f"💡 투자 의견: {result['opinion']}")
-    print(f"📈 종합 점수: {result['score']:.2f}/100")
-    print(f"   ├─ 😊 긍정 뉴스: {result['positive_count']}개")
-    print(f"   ├─ 😢 부정 뉴스: {result['negative_count']}개")
-    print(f"   └─ 😐 중립 뉴스: {result['neutral_count']}개")
-    print("="*70)
-
-    print("\n📋 상세 분석 결과:")
-    display(df_weighted[['title', 'sentiment_label', 'sentiment_score',
-                         'time_weight', 'weighted_sentiment_score']])
-
-    filename = f"{stock_name}_분석_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    df_weighted.to_csv(filename, index=False, encoding='utf-8-sig')
-    print(f"\n💾 '{filename}' 저장 완료")
+print("ngrok 터널 생성 중(8501)...")
+try:
+    # 8501 포트를 HTTPS 공개 URL로 터널링
+    public_url = ngrok.connect(8501, bind_tls=True)
+    print("--------------------------------------------------")
+    print("접속 URL:")
+    print(public_url.public_url)
+    print("--------------------------------------------------")
+except Exception as e:
+    print("에러:", e)
