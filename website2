@@ -1,0 +1,561 @@
+import os
+import subprocess
+import time
+
+# -------------------- 네 정보 (네이버 API / ngrok 토큰) --------------------
+# 네이버 개발자센터에서 발급받은 Client ID / Secret
+NAVER_CLIENT_ID = "ecYEiO4jCcscXg40JQGT"
+NAVER_CLIENT_SECRET = "sxBs21o8a6"
+# ngrok 대시보드에서 발급받은 Your Authtoken
+NGROK_AUTH_TOKEN = "3EcXC4rOgIKn3Z9b5g99rrBcOLU_gjuTaXygHVy2Jr6DZ7Kn"
+# ------------------------------------------------------------------------
+
+# 코랩 환경에 필요한 라이브러리 설치
+#  - streamlit : 웹 대시보드
+#  - requests  : HTTP 요청 라이브러리
+#  - beautifulsoup4 : (현재 코드에서는 안 쓰지만, 추후 HTML 파싱용)
+#  - pyngrok  : ngrok 터널 생성용
+#  - pandas   : 테이블/데이터프레임 처리
+os.system("pip install streamlit requests beautifulsoup4 pyngrok pandas -q")
+
+# 🔵 Streamlit 다크 테마 설정 파일(.streamlit/config.toml)을 자동 생성
+#  - Streamlit이 실행될 때 이 설정을 읽어 다크 모드 + 색상 팔레트를 적용한다.
+os.makedirs(".streamlit", exist_ok=True)
+with open(".streamlit/config.toml", "w", encoding="utf-8") as f:
+    f.write(
+        """
+[theme]
+base = "dark"
+primaryColor = "#4FC3F7"
+backgroundColor = "#050816"
+secondaryBackgroundColor = "#111827"
+textColor = "#F9FAFB"
+font = "sans serif"
+"""
+    )
+
+from pyngrok import ngrok
+
+# 아래는 Streamlit 앱 코드(app.py)를 하나의 문자열로 만든 다음
+# 파일로 저장하는 방식이다.
+app_py_text = """
+import streamlit as st
+import requests
+import pandas as pd
+from datetime import datetime
+import math
+import re
+import random
+
+# ==========================
+# 1. 네이버 뉴스 API 설정
+# ==========================
+NAVER_CLIENT_ID = "{NAVER_CLIENT_ID}"
+NAVER_CLIENT_SECRET = "{NAVER_CLIENT_SECRET}"
+
+def crawl_naver_news(search_keyword):
+    # 네이버 뉴스 검색 Open API를 사용해
+    # 특정 키워드(search_keyword) 관련 최신 뉴스 최대 100개를 가져오는 함수
+    url = "https://openapi.naver.com/v1/search/news.json"
+    params = {
+        "query": search_keyword,  # 검색어
+        "display": 100,          # 최대 100개 (네이버 뉴스 API display 최대값)
+        "sort": "date"           # 최신순 정렬
+    }
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+    }
+    try:
+        # 타임아웃 5초로 설정하여 너무 오래 기다리지 않음
+        resp = requests.get(url, headers=headers, params=params, timeout=5)
+        resp.raise_for_status()          # HTTP 에러 발생 시 예외 발생
+        data = resp.json()
+        return data.get("items", [])     # 뉴스 item 리스트 반환
+    except Exception as e:
+        print("API 에러:", e)
+        return []
+
+def parse_pubdate_to_datetime(pubdate_str):
+    # 네이버 뉴스에서 주는 pubDate 문자열을
+    # Python datetime 객체로 변환하는 함수
+    try:
+        # 예: 'Mon, 03 Jun 2026 19:42:00 +0900' 형식
+        return datetime.strptime(pubdate_str, "%a, %d %b %Y %H:%M:%S %z")
+    except Exception:
+        return None
+
+def calc_time_weight(pub_dt, now_dt):
+    # 발행 시간(pub_dt)이 현재(now_dt)와 얼마나 떨어져 있는지에 따라
+    # 시간 가중치를 계산하는 함수.
+    #
+    # - pub_dt가 None이면 0.150으로 고정 (정보 없음 → 가치 낮게)
+    # - 0시간 차이: 가중치 1.0
+    # - 24시간 차이: exp(-24/24) ≈ 0.37
+    # - 48시간 차이: exp(-48/24) ≈ 0.14
+    # - 너무 작아지지 않도록 하한 0.05 설정
+    if pub_dt is None:
+        return 0.150
+
+    # 현재(now_dt)와의 시차를 '시간' 단위로 계산
+    hours = (now_dt - pub_dt).total_seconds() / 3600.0
+    # 이론적으로 미래 시점의 뉴스는 없지만, 만약 음수가 나오면 0으로 보정
+    if hours < 0:
+        hours = 0.0
+
+    # 지수 감소 함수: 시간이 지날수록 가중치가 지수적으로 줄어듦
+    w_raw = math.exp(-hours / 24.0)
+
+    # 0.05 ~ 1.0 사이로 클리핑해서 너무 작거나 크지 않게 제한
+    w = max(0.050, min(1.000, w_raw))
+    return w
+
+# ======================================================
+# 2. 규칙 기반 감성 "모델"
+# ======================================================
+
+# 강한 긍정 키워드 (나오면 +6점씩)
+strong_pos = [
+    "급등", "폭등", "대폭 상승", "역대급 실적",
+    "신기록 달성", "어닝 서프라이즈", "사상 최대", "강한 매수세"
+]
+
+# 약한 긍정 키워드 (나오면 +2.5점씩)
+weak_pos = [
+    "상승", "반등", "강세", "호재", "호실적",
+    "개선", "성장", "확대", "수혜", "양호", "호전"
+]
+
+# 강한 부정 키워드 (나오면 -6점씩)
+strong_neg = [
+    "급락", "폭락", "대폭 하락", "최악의 실적",
+    "사상 최악", "어닝 쇼크", "파산", "상장폐지"
+]
+
+# 약한 부정 키워드 (나오면 -2.5점씩)
+weak_neg = [
+    "하락", "약세", "악재", "적자", "손실",
+    "부진", "논란", "위기", "경고", "우려",
+    "리스크", "소송", "제재", "부정적"
+]
+
+# 의미를 강화하는 표현들 (현재 방향을 1.8배 증폭)
+amplifiers = ["큰", "크게", "대폭", "강하게", "역대급", "심각한", "심각하게", "매우", "상당한"]
+
+# '+3.5%' 같은 퍼센트 변화를 찾기 위한 정규표현식
+percent_pattern = re.compile(r"([+-]?\\d+(?:\\.\\d+)?)%")
+
+def compute_raw_sentiment_score(text: str) -> float:
+    # 뉴스 제목+요약 텍스트에서
+    # 키워드/퍼센트/상승·하락 표현을 이용해 원시 감성 점수(raw)를 계산
+    t = text.lower()
+    raw = 0.0
+
+    # 1) 키워드 기반 점수 부여
+    for w in strong_pos:
+        if w in t:
+            raw += 6.0
+    for w in weak_pos:
+        if w in t:
+            raw += 2.5
+
+    for w in strong_neg:
+        if w in t:
+            raw -= 6.0
+    for w in weak_neg:
+        if w in t:
+            raw -= 2.5
+
+    # 2) 퍼센트 변동 (+3%, -5% 등)을 점수에 반영
+    for match in percent_pattern.findall(t):
+        try:
+            val = float(match[0])
+        except:
+            continue
+        if val > 0:
+            # 상승 퍼센트가 클수록 더 큰 긍정 점수 (상한 8점)
+            raw += min(8.0, 0.5 * val)
+        elif val < 0:
+            # 하락 퍼센트가 클수록 더 큰 부정 점수 (상한 -8점)
+            raw -= min(8.0, 0.5 * abs(val))
+
+    # 3) 상승/하락/화살표 패턴에 대한 보정
+    if ("↑" in t) or ("상승" in t) or ("급등" in t) or ("강세" in t):
+        raw += 4.0
+    if ("↓" in t) or ("하락" in t) or ("급락" in t) or ("약세" in t):
+        raw -= 4.0
+
+    # 4) 강조어(역대급, 심각한 등)가 있으면 현재 방향을 1.8배 증폭
+    if any(amp in t for amp in amplifiers):
+        if raw > 0:
+            raw *= 1.8
+        elif raw < 0:
+            raw *= 1.8
+
+    return raw
+
+def scale_sentiment_force_nonzero(text: str, raw: float) -> float:
+    # 원시 점수 raw를 [-1, 1] 범위로 스케일링하되,
+    # "정확히 0" 값만 피하고, 나머지는 자연스럽게 둔다.
+    #  (0이 되면 label을 neutral로 볼 여지가 생기기 때문에 강제로 ± 방향을 부여)
+    if raw == 0.0:
+        direction = random.choice([-1, 1])
+        raw = direction * 1.0  # 아주 작은 비대칭성 부여
+
+    max_abs = 25.0
+    # 너무 큰 raw 값은 [-max_abs, max_abs]로 자른다 → 극단값 제한
+    clipped = max(-max_abs, min(max_abs, raw))
+
+    # -1.0 ~ +1.0 범위로 단순 선형 스케일링
+    scaled = clipped / max_abs
+
+    # float 연산 오차로 딱 0.0이 나오는 경우는 아주 작은 값으로 보정
+    if scaled == 0.0:
+        scaled = 1e-6  # 0.000001 수준의 양수
+
+    return scaled
+
+def sentiment_label_from_score(scaled: float) -> str:
+    # 스케일링된 점수의 부호에 따라 라벨을 결정
+    if scaled > 0.0:
+        return "positive"
+    else:
+        return "negative"
+
+def make_investment_decision(total_weighted_score):
+    # 뉴스 전체의 가중 감성 점수 합(total_weighted_score)에 따라
+    # 최종 투자 의견(매수/매도/관망)을 결정
+    if total_weighted_score >= 0.3:
+        return "매수", "최근 뉴스 전반이 규칙 기반 감성 분석에서 긍정으로 우세하므로 매수 의견입니다."
+    elif total_weighted_score <= -0.3:
+        return "매도", "최근 뉴스 전반이 규칙 기반 감성 분석에서 부정으로 우세하므로 매도 의견입니다."
+    else:
+        return "관망", "긍정/부정이 큰 차이 없이 섞여 있어 관망 의견입니다."
+
+# 🔵 키워드 기반 관련 단어 생성 함수
+def make_related_terms(keyword: str):
+    \"\"\"예: '삼성전자' → ['삼성전자', '삼성']
+        예: 'LG에너지솔루션' → ['lg에너지솔루션', 'lg']
+
+    - 원 키워드 전체(소문자) + 공백으로 나눈 첫 단어(소문자)를 관련 단어 집합으로 사용
+    - 이후 제목/요약 텍스트에 이 단어들 중 하나라도 없으면 "관련 없음"으로 보고 필터링
+    \"\"\"
+    kw = keyword.strip()
+    if not kw:
+        return []
+
+    # 소문자 기준으로 처리 (대소문자 차이 제거)
+    kw_lower = kw.lower()
+
+    # 공백으로 나눠서 첫 단어를 뽑는다 (예: 'LG 에너지솔루션' → 'lg')
+    first_token = kw_lower.split()[0]
+
+    # set을 이용해 중복 제거 후 리스트 변환
+    terms = {kw_lower, first_token}
+    return list(terms)
+
+# ==========================
+# 3. Streamlit 화면 구성
+# ==========================
+
+# 페이지 기본 설정: 제목 + 와이드 레이아웃
+st.set_page_config(page_title="AI 뉴스 감성분석기", layout="wide")
+
+# 상단 헤더: 다크 그라데이션 카드 + 타이틀/설명
+with st.container():
+    st.markdown(
+        '''
+        <div style="
+            background: radial-gradient(circle at top left, #1D4ED8 0, #020617 45%);
+            padding:22px 32px;
+            border-radius:18px;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            box-shadow: 0 18px 45px rgba(15, 23, 42, 0.9);
+            margin-bottom: 10px;
+        ">
+            <h1 style="text-align: center; color: #E5E7EB; margin-bottom: 0.3rem; font-size: 2.1rem;">
+                📈 AI 뉴스 감성 분석 백테스터
+            </h1>
+            <p style="text-align: center; color: #9CA3AF; margin-top: 0.4rem; font-size: 0.95rem;">
+                <span style="color:#4FC3F7;">네이버 뉴스</span> →
+                규칙 기반 감성 점수 →
+                시간 가중치 →
+                <span style="color:#22C55E;">매수 / 관망 / 매도</span>
+            </p>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
+
+# 상단 헤더와 본문 사이 구분선
+st.markdown(
+    '<hr style="border:0; border-top:1px solid rgba(148,163,184,0.25); margin: 4px 0 14px 0;">',
+    unsafe_allow_html=True,
+)
+
+# 사이드바: 키워드 입력 + 버튼
+with st.sidebar:
+    st.markdown(
+        '''
+        <h3 style="color:#E5E7EB; margin-bottom:0.5rem;">⚙️ 설정</h3>
+        <p style="font-size: 0.85rem; color:#9CA3AF; line-height:1.5;">
+        분석할 <span style="color:#4FC3F7;">종목/키워드</span>를 입력한 뒤,<br>
+        아래 버튼을 눌러 최신 뉴스를 기반으로<br>
+        감성 분석을 실행합니다.
+        </p>
+        ''',
+        unsafe_allow_html=True,
+    )
+    # 기본값: 삼성전자 (사용자가 자유롭게 변경 가능)
+    stock_name = st.text_input("분석할 주식 종목명 또는 키워드", value="삼성전자")
+    st.markdown(
+        '<div style="border-top:1px solid rgba(148,163,184,0.25); margin:10px 0 8px 0;"></div>',
+        unsafe_allow_html=True,
+    )
+    run_btn = st.button("🚀 뉴스 수집 및 감성 분석 시작", use_container_width=True)
+
+if run_btn:
+    # 1단계: 뉴스 수집
+    with st.spinner("1️⃣ 뉴스 수집 시작... 잠시만 기다려주세요 ⏳"):
+        items = crawl_naver_news(stock_name)
+
+    st.markdown(
+        f'<p style="color:#9CA3AF; font-size:0.9rem;">가져온 원시 뉴스 개수: <span style="color:#4FC3F7;">{len(items)}</span></p>',
+        unsafe_allow_html=True,
+    )
+
+    if not items:
+        st.error("뉴스를 가져오지 못했습니다. (items 목록이 비었습니다)")
+    else:
+        # 2단계: 감성 점수/시간 가중치 계산
+        with st.spinner("2️⃣ 감성 점수 및 시간 가중치 계산 중... ⚙️"):
+            now_dt = datetime.now().astimezone()
+            records = []
+
+            # 관련 단어 리스트 (예: ['삼성전자', '삼성'])
+            related_terms = make_related_terms(stock_name)
+
+            for i, item in enumerate(items, start=1):
+                title = item.get("title", "").replace("<b>", "").replace("</b>", "")
+                desc = item.get("description", "").replace("<b>", "").replace("</b>", "")
+                link = item.get("link", "")
+                pub_date = item.get("pubDate", "")
+
+                text_for_sent = (title + " " + desc).strip()
+                if not text_for_sent:
+                    continue
+
+                t_lower = text_for_sent.lower()
+
+                # 🔵 필터링 로직:
+                #  - 예: 키워드가 '삼성전자'이면 '삼성전자' or '삼성'이 들어간 기사만 통과
+                #  - related_terms 리스트 중 하나라도 포함되지 않으면 continue로 스킵
+                if related_terms:
+                    if not any(term in t_lower for term in related_terms):
+                        continue
+
+                raw_score = compute_raw_sentiment_score(text_for_sent)
+                scaled_score = scale_sentiment_force_nonzero(text_for_sent, raw_score)
+                label = sentiment_label_from_score(scaled_score)
+
+                pub_dt = parse_pubdate_to_datetime(pub_date)
+                time_weight = calc_time_weight(pub_dt, now_dt)
+                weighted_score = scaled_score * time_weight
+
+                # 소수점 2자리까지 정리 (보기 좋게 표시)
+                scaled_2 = float(f"{scaled_score:.2f}")
+                time_w_2 = float(f"{time_weight:.2f}")
+                weighted_2 = float(f"{weighted_score:.2f}")
+
+                records.append({
+                    "제목": title,
+                    "요약": desc,
+                    "링크": link,
+                    "발행시각(raw)": pub_date,
+                    "발행시각": pub_dt.strftime("%Y-%m-%d %H:%M") if pub_dt else "",
+                    "감성라벨": label,
+                    "감성스코어(수치화)": scaled_2,
+                    "시간가중치": time_w_2,
+                    "가중감성점수": weighted_2,
+                })
+
+        st.success(f"✅ 3️⃣ 감성 분석된 뉴스 개수: {len(records)}")
+
+        if not records:
+            # 필터링까지 거치고 나서 남은 뉴스가 없을 때
+            st.error("필터링 이후 남은 뉴스가 없습니다. (키워드 관련성이 높은 뉴스가 부족합니다.)")
+        else:
+            df = pd.DataFrame(records)
+            total_weighted_score = float(df["가중감성점수"].sum())
+            decision, reason = make_investment_decision(total_weighted_score)
+
+            # 화면에 표시할 분석 주제 문구 (검색 키워드 기준 자동 생성)
+            analysis_topic = f"'{stock_name}' 관련 최신 이슈 및 투자 심리 동향 분석"
+
+            # 감성 라벨 컬럼에 색상을 입히기 위한 스타일 함수
+            def style_sentiment(s: pd.DataFrame) -> pd.DataFrame:
+                styles = pd.DataFrame("", index=s.index, columns=s.columns)
+                if "감성라벨" in s.columns:
+                    for i, v in enumerate(s["감성라벨"]):
+                        if v == "positive":
+                            styles.loc[i, "감성라벨"] = "background-color: rgba(34, 197, 94, 0.28); color: #BBF7D0;"
+                        elif v == "negative":
+                            styles.loc[i, "감성라벨"] = "background-color: rgba(248, 113, 113, 0.32); color: #FECACA;"
+                return styles
+
+            st.markdown(
+                '''
+                <h3 style="color:#E5E7EB; margin-top:8px; margin-bottom:8px;">📌 최종 투자 판단</h3>
+                ''',
+                unsafe_allow_html=True,
+            )
+            col_a, col_b, col_c = st.columns([1, 1, 2])
+
+            # 왼쪽: 가중 합산 감성 점수
+            with col_a:
+                st.markdown(
+                    '''
+                    <div style="
+                        background: linear-gradient(135deg, #0F172A 0%, #020617 60%);
+                        padding:14px;
+                        border-radius:14px;
+                        border:1px solid rgba(148,163,184,0.4);
+                    ">
+                    ''',
+                    unsafe_allow_html=True,
+                )
+                st.metric("가중 합산 감성 점수", f"{total_weighted_score:.2f}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            # 가운데: 최종 매수/관망/매도 의견
+            with col_b:
+                if decision == "매수":
+                    badge_color = "#22C55E"
+                elif decision == "매도":
+                    badge_color = "#F97316"
+                else:
+                    badge_color = "#EAB308"
+                st.markdown(
+                    f'''
+                    <div style="
+                        background: radial-gradient(circle at top, #0F172A 0%, #020617 55%);
+                        padding:14px;
+                        border-radius:14px;
+                        border:1px solid rgba(148,163,184,0.4);
+                    ">
+                        <div style="margin-bottom:8px; font-size:0.85rem; color:#9CA3AF;">최종 의견</div>
+                        <div style="font-size:1.4rem; font-weight:700; color:{badge_color};">
+                            {decision}
+                        </div>
+                    </div>
+                    ''',
+                    unsafe_allow_html=True,
+                )
+
+            # 오른쪽: 분석 주제 + 판단 근거
+            with col_c:
+                st.markdown(
+                    '''
+                    <div style="
+                        background: linear-gradient(135deg, rgba(59,130,246,0.18), rgba(15,23,42,0.95));
+                        padding:16px 18px;
+                        border-radius:14px;
+                        border:1px solid rgba(96,165,250,0.5);
+                    ">
+                    ''',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    '<div style="font-size:0.85rem; color:#BFDBFE; margin-bottom:4px;">이번 분석 주제</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div style="font-size:1.0rem; font-weight:600; color:#E5E7EB; margin-bottom:10px;">{analysis_topic}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    '<div style="font-size:0.85rem; color:#9CA3AF; margin-bottom:4px;">판단 근거</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"<div style='font-size:0.9rem; color:#E5E7EB;'>{reason}</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+
+            # 표 탭 구성: 기본 데이터 / 디버깅용 전체 데이터
+            st.markdown(
+                '''
+                <h3 style="color:#E5E7EB; margin-top:10px; margin-bottom:6px;">📊 뉴스 감성 분석 테이블</h3>
+                ''',
+                unsafe_allow_html=True,
+            )
+            tab1, tab2 = st.tabs(["기본 데이터", "디버깅용 전체 데이터"])
+
+            with tab1:
+                st.markdown(
+                    '<p style="color:#9CA3AF; font-size:0.85rem; margin-bottom:4px;">'
+                    '각 뉴스의 제목, 발행시각, 감성 라벨 및 스코어를 요약해서 보여줍니다.'
+                    '</p>',
+                    unsafe_allow_html=True,
+                )
+                base_df = df[["제목", "발행시각", "감성라벨", "감성스코어(수치화)", "시간가중치"]]
+                styled = base_df.style.apply(style_sentiment, axis=None)
+                st.dataframe(styled, use_container_width=True)
+
+            with tab2:
+                st.markdown(
+                    '<p style="color:#9CA3AF; font-size:0.85rem; margin-bottom:4px;">'
+                    'raw 점수와 가중감성점수를 포함한 전체 데이터를 확인하고 싶을 때 사용하세요.'
+                    '</p>',
+                    unsafe_allow_html=True,
+                )
+                styled_full = df.style.apply(style_sentiment, axis=None)
+                st.dataframe(styled_full, use_container_width=True)
+"""
+
+# 위 문자열에서 네이버 키를 실제 값으로 치환
+#  - 문자열 안의 {NAVER_CLIENT_ID}, {NAVER_CLIENT_SECRET}을 실제 값으로 바꿔 넣는다.
+app_py_text = app_py_text.replace("{NAVER_CLIENT_ID}", NAVER_CLIENT_ID)
+app_py_text = app_py_text.replace("{NAVER_CLIENT_SECRET}", NAVER_CLIENT_SECRET)
+
+# app.py 파일로 저장
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_py_text)
+
+print("app.py 생성 완료")
+
+# ==========================
+# 4. ngrok + Streamlit 실행
+# ==========================
+
+from pyngrok import ngrok
+
+print("ngrok 토큰 설정 중...")
+# ngrok 대시보드에서 받은 Authtoken을 사용해 인증
+ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+
+print("Streamlit 서버 가동 중...")
+# 코랩에서 외부 접속 가능하도록 0.0.0.0:8501 에서 스트림릿 실행
+streamlit_proc = subprocess.Popen(
+    ["streamlit", "run", "app.py", "--server.port", "8501", "--server.address", "0.0.0.0"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+# 서버가 완전히 올라올 때까지 잠시 대기
+time.sleep(8)
+
+print("기존 ngrok 세션 종료...")
+# 혹시 이전에 열려 있던 ngrok 터널이 있으면 정리
+ngrok.kill()
+
+print("ngrok 터널 생성 중(8501)...")
+try:
+    # 8501 포트를 HTTPS 공개 URL로 터널링
+    public_url = ngrok.connect(8501, bind_tls=True)
+    print("--------------------------------------------------")
+    print("접속 URL:")
+    print(public_url.public_url)
+    print("--------------------------------------------------")
+except Exception as e:
+    print("에러:", e)
