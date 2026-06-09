@@ -4,10 +4,10 @@ import time
 
 # -------------------- 네 정보 (네이버 API / ngrok 토큰) --------------------
 # 네이버 개발자센터에서 발급받은 Client ID / Secret
-NAVER_CLIENT_ID = "ecYEiO4jCcscXg40JQGT"
-NAVER_CLIENT_SECRET = "sxBs21o8a6"
+NAVER_CLIENT_ID = "발급받은 Client ID 입력하세요"
+NAVER_CLIENT_SECRET = "발급받은 Client Secret 입력하세요"
 # ngrok 대시보드에서 발급받은 Your Authtoken
-NGROK_AUTH_TOKEN = "3EcXC4rOgIKn3Z9b5g99rrBcOLU_gjuTaXygHVy2Jr6DZ7Kn"
+NGROK_AUTH_TOKEN = "발급받은  입력하세요"
 # ------------------------------------------------------------------------
 
 # 코랩 환경에 필요한 라이브러리 설치
