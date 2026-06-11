@@ -24,7 +24,7 @@
 
 ---
 
-
+## 코드 실행 사진
 
 
 <img width="1919" height="754" alt="KakaoTalk_20260611_181436663_01" src="https://github.com/user-attachments/assets/7cb31ba0-3130-4164-abc3-c2a34a1f1f9d" />
