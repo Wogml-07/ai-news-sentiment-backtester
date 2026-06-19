@@ -1,0 +1,6 @@
+Hugging Face 오픈소스 한국어 자연어처리(NLP) 모델 선정 및 이식
+
+KR-FinBERT-SC
+이 소스로 크롤링된 뉴스 텍스트의 긍정/부정 감성 스코어링(Sentiment Scoring) 알고리즘 구현해줘
+
+코랩으로 만들어줘.
